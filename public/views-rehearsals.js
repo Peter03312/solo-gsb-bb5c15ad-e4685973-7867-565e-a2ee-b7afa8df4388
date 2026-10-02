@@ -1,4 +1,21 @@
 /* 导演：排练与确认 + 总览 */
+const SCHED_STATUS_LABEL = { active: '有效', needs_adjustment: '待调整', cancelled: '已取消' };
+const SCHED_STATUS_CLASS = { active: 'done', needs_adjustment: 'pending', cancelled: 'abandoned' };
+
+function fmtTime(iso) {
+  return new Date(iso).toLocaleString('zh-CN', { hour12: false });
+}
+
+/** 日程冲突（409 SCHEDULE_CONFLICT）时把冲突演员一并提示 */
+function scheduleErr(err) {
+  const conflicts = err?.data?.details?.conflicts;
+  if (Array.isArray(conflicts) && conflicts.length) {
+    const actors = [...new Set(conflicts.map((c) => c.actorName))].join('、');
+    return `${err.message}（冲突演员：${actors}）`;
+  }
+  return err.message;
+}
+
 async function loadRehearsalsTab() {
   const panel = document.getElementById('tab-rehearsals');
   panel.innerHTML = '<p class="muted">加载中…</p>';
@@ -100,9 +117,10 @@ function renderRehearsalDetail(data, reload) {
     if (!confirm(`确定将排练切换固定到 v? 仅文本变化的角色×场次需要重新确认。`)) return;
     try {
       const r = await api('POST', `/api/rehearsals/${rehearsal.id}/switch-version`, { versionId: vid });
-      toast(`已换版；待确认 ${r.pending.length} 项`);
+      const adj = r.needsAdjustmentSchedules?.length ? `；待调整时段 ${r.needsAdjustmentSchedules.length} 个` : '';
+      toast(`已换版；待确认 ${r.pending.length} 项${adj}`);
       toggleRehearsalDetail(rehearsal.id).catch(() => {});
-    } catch (err) { toast(err.message, true); }
+    } catch (err) { toast(scheduleErr(err), true); }
   });
   ver.querySelector('.verLog').textContent = versionLog.length
     ? '换版历史：' + versionLog.map((l) => `v${l.fromNo}→v${l.toNo}`).join('，')
@@ -138,7 +156,7 @@ function renderRehearsalDetail(data, reload) {
       });
       toast('派角已更新（相关确认已重置）');
       toggleRehearsalDetail(rehearsal.id).catch(() => {});
-    } catch (err) { toast(err.message, true); }
+    } catch (err) { toast(scheduleErr(err), true); }
   });
   const rows = castBox.querySelector('.castRows');
   rows.innerHTML = cast.length
@@ -164,6 +182,23 @@ function renderRehearsalDetail(data, reload) {
     : '<span class="badge done">全部确认完毕</span>';
   wrap.appendChild(pendBox);
 
+  // 日程安排：为某场次安排带时区时段；参与者=当前版本本场有台词且已派角的演员
+  const schedBox = el(`
+    <div style="margin-top:8px">
+      <h3>日程安排（带时区时段；重叠即冲突，端点相接不算）</h3>
+      <div class="schedRows muted">加载中…</div>
+      <form class="flex schedForm" style="margin-top:6px">
+        <select name="sceneId" class="sceneSel" style="max-width:180px"></select>
+        <input type="datetime-local" name="startAt" required style="max-width:210px" />
+        <input type="datetime-local" name="endAt" required style="max-width:210px" />
+        <button class="btn small primary schedSubmit" type="submit">保存时段</button>
+        <button class="btn small schedCancelEdit hidden" type="button">放弃调整</button>
+      </form>
+      <div class="muted">按本地时间选择，提交时自动携带时区；结束须晚于开始。未派角角色列为“待补派”，不阻止安排。</div>
+    </div>`);
+  wrap.appendChild(schedBox);
+  setupScheduleEditor(schedBox, rehearsal);
+
   // 冲突详情
   if (lastPublishAttempt && lastPublishAttempt.hadConflict) {
     const cbox = el(`<div style="margin-top:8px"><h3>最近一次发布冲突（本次发布未生效）</h3></div>`);
@@ -184,6 +219,105 @@ function renderRehearsalDetail(data, reload) {
 async function loadActors() {
   // 导演可通过演员列表接口获取；若未暴露则从后端 dashboard 不可得，这里走专用端点
   return (await api('GET', '/api/actors')).actors;
+}
+
+/** 导演：排练日程的列表 / 新建 / 调整 / 取消 */
+function setupScheduleEditor(schedBox, rehearsal) {
+  const sceneSel = schedBox.querySelector('.sceneSel');
+  const submitBtn = schedBox.querySelector('.schedSubmit');
+  const cancelEditBtn = schedBox.querySelector('.schedCancelEdit');
+  let editingId = null;
+
+  api('GET', `/api/plays/${rehearsal.playId}`).then((detail) => {
+    sceneSel.innerHTML = detail.scenes
+      .map((s) => `<option value="${s.id}">${esc(s.code)} ${esc(s.title)}</option>`)
+      .join('');
+  });
+
+  const toLocalInput = (iso) => {
+    const d = new Date(iso);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  const resetEdit = () => {
+    editingId = null;
+    submitBtn.textContent = '保存时段';
+    cancelEditBtn.classList.add('hidden');
+  };
+  cancelEditBtn.addEventListener('click', resetEdit);
+
+  async function reloadSchedules() {
+    const rowsBox = schedBox.querySelector('.schedRows');
+    let schedules;
+    try {
+      ({ schedules } = await api('GET', `/api/rehearsals/${rehearsal.id}/schedules`));
+    } catch (err) {
+      rowsBox.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
+      return;
+    }
+    if (!schedules.length) {
+      rowsBox.innerHTML = '<span class="muted">暂无日程</span>';
+      return;
+    }
+    rowsBox.innerHTML = `<table>
+      <tr><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>操作</th></tr>
+      ${schedules.map((s) => `<tr>
+        <td>${esc(s.sceneCode)} ${esc(s.sceneTitle)}</td>
+        <td>${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</td>
+        <td><span class="badge ${SCHED_STATUS_CLASS[s.status]}">${SCHED_STATUS_LABEL[s.status]}</span></td>
+        <td>${s.participants.map((p) => esc(p.actorName)).join('、') || '<span class="muted">无</span>'}</td>
+        <td>${s.pendingCast.map((p) => esc(p.roleName)).join('、') || '—'}</td>
+        <td>${s.status !== 'cancelled'
+          ? `<button class="btn small editSched" data-id="${s.id}">调整</button>
+             <button class="btn small danger cancelSched" data-id="${s.id}">取消</button>`
+          : ''}</td>
+      </tr>`).join('')}
+    </table>`;
+    rowsBox.querySelectorAll('.cancelSched').forEach((b) =>
+      b.addEventListener('click', async () => {
+        try {
+          await api('POST', `/api/rehearsals/${rehearsal.id}/schedules/${b.dataset.id}/cancel`);
+          toast('该时段已取消');
+          reloadSchedules();
+        } catch (err) { toast(scheduleErr(err), true); }
+      })
+    );
+    rowsBox.querySelectorAll('.editSched').forEach((b) =>
+      b.addEventListener('click', () => {
+        const s = schedules.find((x) => String(x.id) === b.dataset.id);
+        if (!s) return;
+        editingId = s.id;
+        sceneSel.value = String(s.sceneId);
+        schedBox.querySelector('[name=startAt]').value = toLocalInput(s.startAt);
+        schedBox.querySelector('[name=endAt]').value = toLocalInput(s.endAt);
+        submitBtn.textContent = '保存调整';
+        cancelEditBtn.classList.remove('hidden');
+      })
+    );
+  }
+
+  schedBox.querySelector('.schedForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const body = {
+      sceneId: Number(fd.get('sceneId')),
+      startAt: new Date(fd.get('startAt')).toISOString(),
+      endAt: new Date(fd.get('endAt')).toISOString(),
+    };
+    try {
+      if (editingId) {
+        await api('PATCH', `/api/rehearsals/${rehearsal.id}/schedules/${editingId}`, body);
+        toast('时段已调整');
+      } else {
+        await api('POST', `/api/rehearsals/${rehearsal.id}/schedules`, body);
+        toast('时段已保存');
+      }
+      resetEdit();
+      reloadSchedules();
+    } catch (err) { toast(scheduleErr(err), true); }
+  });
+
+  reloadSchedules();
 }
 
 async function loadDashboard() {
@@ -270,6 +404,21 @@ async function loadActorScript(rehearsalId) {
     </div>`);
   head.querySelector('#backBtn').addEventListener('click', loadActorHome);
   panel.appendChild(head);
+
+  // 我的排练时段：仅自己当前参与的有效时段
+  let mySchedules = [];
+  try {
+    ({ schedules: mySchedules } = await api('GET', `/api/rehearsals/${rehearsalId}/schedules`));
+  } catch { mySchedules = []; }
+  const schedCard = el('<div class="card"><h2>我的排练时段</h2><div class="mySched"></div></div>');
+  schedCard.querySelector('.mySched').innerHTML = mySchedules.length
+    ? mySchedules.map((s) => `
+      <div class="line-row">
+        <div class="meta">${esc(s.sceneCode)} ${esc(s.sceneTitle)} · ${(s.myRoles || []).map((r) => esc(r.roleName)).join('、')}</div>
+        <div>${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</div>
+      </div>`).join('')
+    : '<span class="muted">暂无日程安排</span>';
+  panel.appendChild(schedCard);
 
   const scenes = new Map();
   for (const l of lines) {

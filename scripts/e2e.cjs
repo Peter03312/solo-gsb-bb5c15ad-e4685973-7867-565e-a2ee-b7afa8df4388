@@ -178,13 +178,18 @@ async function main() {
   check('作废幂等保护（再次作废 400）', true);
 
   console.log('— 版本不可改写（数据库触发器） —');
-  const { db } = require('/workspace/src/db.js');
+  // 用独立内存库自检触发器（不依赖本地 ./data 目录的残留状态）
+  process.env.DB_PATH = ':memory:';
+  const { db: memdb } = require('/workspace/src/db.js');
+  const tPlay = memdb.prepare('INSERT INTO plays (title) VALUES (?)').run('触发器自检').lastInsertRowid;
+  const tVer = memdb.prepare('INSERT INTO versions (play_id, version_no) VALUES (?, 1)').run(tPlay).lastInsertRowid;
+  memdb.prepare('INSERT INTO version_lines (version_id, line_id, scene_id, role_id, seq, text) VALUES (?, 1, 1, 1, 1, ?)').run(tVer, 'x');
   let blockedUpdate = false;
-  try { db.prepare('UPDATE versions SET note = ? WHERE id = 1').run('hacked'); } catch { blockedUpdate = true; }
+  try { memdb.prepare('UPDATE versions SET note = ? WHERE id = ?').run('hacked', tVer); } catch { blockedUpdate = true; }
   let blockedVL = false;
-  try { db.prepare('UPDATE version_lines SET text = ? WHERE line_id = 1 AND version_id = 1').run('h'); } catch { blockedVL = true; }
+  try { memdb.prepare('UPDATE version_lines SET text = ? WHERE version_id = ?').run('h', tVer); } catch { blockedVL = true; }
   let blockedDel = false;
-  try { db.prepare('DELETE FROM versions WHERE id = 1').run(); } catch { blockedDel = true; }
+  try { memdb.prepare('DELETE FROM versions WHERE id = ?').run(tVer); } catch { blockedDel = true; }
   check('versions UPDATE/DELETE 与 version_lines UPDATE 被触发器拒绝', blockedUpdate && blockedVL && blockedDel);
 
   console.log('— 排练：创建固定版本、派角、确认、换版 —');
@@ -245,6 +250,152 @@ async function main() {
   check('总览含冲突详情', dash.recentConflicts.some((c) => c.details.length > 0));
   const attempts = (await G(`/api/plays/${playId}/publish-attempts`, director)).attempts;
   check('发布尝试历史含成功与冲突两种', attempts.some((a) => a.hadConflict) && attempts.some((a) => !a.hadConflict));
+
+  console.log('— 排练日程：带时区时段、参与者、待补派 —');
+  const chenId = actors.find((a) => a.username === 'chen').id;
+  // 专用剧本：sc1/sc2/scEmpty；角色 RA/RB
+  const p2 = await J('/api/plays', director, { title: '日程测试剧' }, 201);
+  const sc1 = (await J(`/api/plays/${p2.id}/scenes`, director, { code: 'A1', title: '码头' }, 201)).id;
+  const sc2 = (await J(`/api/plays/${p2.id}/scenes`, director, { code: 'A2', title: '船舱' }, 201)).id;
+  const scEmpty = (await J(`/api/plays/${p2.id}/scenes`, director, { code: 'A3', title: '空场' }, 201)).id;
+  const roleA = (await J(`/api/plays/${p2.id}/roles`, director, { code: 'RA', name: '甲' }, 201)).id;
+  const roleB = (await J(`/api/plays/${p2.id}/roles`, director, { code: 'RB', name: '乙' }, 201)).id;
+  await J(`/api/plays/${p2.id}/lines`, director, { sceneId: sc1, roleId: roleA, text: '甲一句一', seq: 1 }, 201);
+  await J(`/api/plays/${p2.id}/lines`, director, { sceneId: sc2, roleId: roleA, text: '甲二句一', seq: 1 }, 201);
+  await J(`/api/plays/${p2.id}/lines`, director, { sceneId: sc2, roleId: roleB, text: '乙二句一', seq: 2 }, 201);
+  const pv1 = (await J(`/api/plays/${p2.id}/publish-initial`, director, { note: 'v1' }, 201)).version.id;
+  // v2：给乙在 sc1 加一句（换版后乙才在 sc1 有台词）
+  const revAddB = await J(`/api/plays/${p2.id}/revisions`, director, { title: '乙加 sc1 台词' }, 201);
+  await J(`/api/revisions/${revAddB.id}/items`, director, { action: 'add', sceneId: sc1, roleId: roleB, newText: '乙一句一', seq: 2 }, 201);
+  const pv2 = (await J(`/api/plays/${p2.id}/publish`, director, { revisionIds: [revAddB.id] }, 201)).newVersion.id;
+  // v3：删掉 sc2 全部台词（换版后 sc2 场次无台词 -> 既有安排待调整）
+  const p2detail = await G(`/api/plays/${p2.id}`, director);
+  const revDel2 = await J(`/api/plays/${p2.id}/revisions`, director, { title: '清空 sc2' }, 201);
+  await J(`/api/revisions/${revDel2.id}/items`, director, { action: 'delete', lineId: p2detail.lines.find((l) => l.text === '甲二句一').id, oldText: '甲二句一' }, 201);
+  await J(`/api/revisions/${revDel2.id}/items`, director, { action: 'delete', lineId: p2detail.lines.find((l) => l.text === '乙二句一').id, oldText: '乙二句一' }, 201);
+  const pv3 = (await J(`/api/plays/${p2.id}/publish`, director, { revisionIds: [revDel2.id] }, 201)).newVersion.id;
+
+  // RH_A 固定 v2：甲=林晚，乙=陈默
+  const rhA = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '日程排练A' }, 201)).id;
+  await J(`/api/rehearsals/${rhA}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhA}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+
+  // 校验：演员越权 / 排练不存在 / 无时区 / 结束不晚于开始 / 场次无效 / 场次当前版本无台词
+  await J(`/api/rehearsals/${rhA}/schedules`, lin, { sceneId: sc1, startAt: '2030-01-01T10:00:00+08:00', endAt: '2030-01-01T11:00:00+08:00' }, 403);
+  await J('/api/rehearsals/99999/schedules', director, { sceneId: sc1, startAt: '2030-01-01T10:00:00+08:00', endAt: '2030-01-01T11:00:00+08:00' }, 404);
+  await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-01T10:00', endAt: '2030-01-01T11:00:00+08:00' }, 400);
+  await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-01T11:00:00+08:00', endAt: '2030-01-01T10:00:00+08:00' }, 400);
+  await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: 99999, startAt: '2030-01-01T10:00:00+08:00', endAt: '2030-01-01T11:00:00+08:00' }, 400);
+  await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: detail.scenes[0].id, startAt: '2030-01-01T10:00:00+08:00', endAt: '2030-01-01T11:00:00+08:00' }, 400);
+  await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: scEmpty, startAt: '2030-01-01T10:00:00+08:00', endAt: '2030-01-01T11:00:00+08:00' }, 400);
+  check('日程：越权/无排练/无时区/起止颠倒/无效场次/无台词场次均被拒', true);
+
+  // 正常创建：参与者=当前版本本场有台词且已派角的演员
+  const schA1 = (await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-01T10:00:00+08:00', endAt: '2030-01-01T11:00:00+08:00' }, 201)).schedule;
+  check('日程参与者为有台词且已派角的演员', schA1.participants.length === 2 && schA1.participants.every((p) => [linId, chenId].includes(p.actorId)), JSON.stringify(schA1.participants));
+  check('全部派角时无待补派', schA1.pendingCast.length === 0);
+  // 端点相接不算重叠
+  const schA2 = (await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc2, startAt: '2030-01-01T11:00:00+08:00', endAt: '2030-01-01T12:00:00+08:00' }, 201)).schedule;
+  check('端点相接（11:00 接 11:00）不算重叠', !!schA2.id);
+  // 重叠 -> 409，返回冲突演员与时段
+  const ov = await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-01T10:30:00+08:00', endAt: '2030-01-01T11:30:00+08:00' }, 409);
+  check('时段重叠返回 SCHEDULE_CONFLICT', ov.error === 'SCHEDULE_CONFLICT');
+  check('冲突详情含冲突演员与时段', ov.details.conflicts.some((c) => c.actorId === linId && c.overlapsWith.id === schA1.id), JSON.stringify(ov.details));
+  // 不同时区表示的同一时段也判重叠（10:30+09:00 = 09:30+08:00）
+  const ovTz = await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-01T10:30:00+09:00', endAt: '2030-01-01T12:30:00+09:00' }, 409);
+  check('跨时区同一时间轴同样判重叠', ovTz.error === 'SCHEDULE_CONFLICT');
+  // Z 时区写法，端点相接于 schA2 末端（12:00+08:00 = 04:00Z）
+  const schA3 = (await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-01T04:00:00Z', endAt: '2030-01-01T05:00:00Z' }, 201)).schedule;
+  check('Z 时区可提交且端点相接不冲突', !!schA3.id);
+
+  console.log('— 日程：待补派 / 跨排练冲突 / 派角冲突 —');
+  // RH_B 固定 v1：乙=陈默（v1 中乙在 sc1 无台词）
+  const rhB = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '日程排练B' }, 201)).id;
+  await J(`/api/rehearsals/${rhB}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const schB1 = (await J(`/api/rehearsals/${rhB}/schedules`, director, { sceneId: sc1, startAt: '2030-01-02T10:00:00+08:00', endAt: '2030-01-02T11:00:00+08:00' }, 201)).schedule;
+  check('当前版本无台词角色不参与（参与者为空）', schB1.participants.length === 0);
+  check('未派角色列为待补派，不阻止安排', schB1.pendingCast.some((r) => r.roleId === roleA));
+  const schB2 = (await J(`/api/rehearsals/${rhB}/schedules`, director, { sceneId: sc2, startAt: '2030-01-02T10:00:00+08:00', endAt: '2030-01-02T11:00:00+08:00' }, 201)).schedule;
+  check('参与者按排练当前版本计算', schB2.participants.some((p) => p.actorId === chenId));
+  // 跨排练冲突：陈默在 RH_B 的 sc2 有时段，RH_A 同时段不可再排
+  const ovReh = await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-02T10:30:00+08:00', endAt: '2030-01-02T11:30:00+08:00' }, 409);
+  check('跨排练的演员重叠也冲突', ovReh.details.conflicts.some((c) => c.actorId === chenId && c.overlapsWith.id === schB2.id));
+  const schA4 = (await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-02T11:00:00+08:00', endAt: '2030-01-02T12:00:00+08:00' }, 201)).schedule;
+  check('跨排练端点相接可安排', !!schA4.id);
+
+  // 派角冲突：RH_C 甲=周海并排好时段；陈默在 RH_A 同时段有安排 -> 派角整次拒绝
+  const rhC = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '日程排练C' }, 201)).id;
+  await J(`/api/rehearsals/${rhC}/cast`, director, { roleId: roleA, actorId: zhouId }, 201);
+  const schC1 = (await J(`/api/rehearsals/${rhC}/schedules`, director, { sceneId: sc1, startAt: '2030-01-03T10:00:00+08:00', endAt: '2030-01-03T11:00:00+08:00' }, 201)).schedule;
+  check('待补派列出未派角的有台词角色', schC1.pendingCast.some((r) => r.roleId === roleB));
+  const schA5 = (await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-03T10:30:00+08:00', endAt: '2030-01-03T11:30:00+08:00' }, 201)).schedule;
+  const castConflict = await J(`/api/rehearsals/${rhC}/cast`, director, { roleId: roleB, actorId: chenId }, 409);
+  check('派角与既有时段重叠 -> 整次拒绝', castConflict.error === 'SCHEDULE_CONFLICT' && castConflict.details.conflicts.some((c) => c.actorId === chenId));
+  const rhCsched = await G(`/api/rehearsals/${rhC}/schedules`, director);
+  check('派角被拒绝后仍未派角', rhCsched.schedules.find((s) => s.id === schC1.id).pendingCast.some((r) => r.roleId === roleB));
+  // 取消冲突时段后派角成功
+  await J(`/api/rehearsals/${rhA}/schedules/${schA5.id}/cancel`, director, {}, 200);
+  await J(`/api/rehearsals/${rhC}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  check('取消冲突时段后派角成功', true);
+
+  console.log('— 日程：换版冲突 / 失败换版不动版本与确认 / 待调整 —');
+  // 陈默先确认 RH_B 的 sc2（v1），验证失败换版不影响确认
+  await J(`/api/rehearsals/${rhB}/confirm`, chen, { roleId: roleB, sceneId: sc2 }, 200);
+  // RH_B v1->v2：schB1(sc1) 将纳入陈默，与同排练同时段 schB2(sc2) 冲突
+  const swFail = await J(`/api/rehearsals/${rhB}/switch-version`, director, { versionId: pv2 }, 409);
+  check('换版后参与者重叠 -> 换版整次拒绝', swFail.error === 'SCHEDULE_CONFLICT' && swFail.details.conflicts.some((c) => c.actorId === chenId), JSON.stringify(swFail));
+  const rhBAfter = await G(`/api/rehearsals/${rhB}`, director);
+  check('失败的换版不改变版本', rhBAfter.rehearsal.versionId === pv1);
+  check('失败的换版不改变确认', !rhBAfter.pending.some((p) => p.actorId === chenId));
+  // 调整 schB1 到不相交时段后，换版成功
+  const adjB1 = await req('PATCH', `/api/rehearsals/${rhB}/schedules/${schB1.id}`, director, { startAt: '2030-01-02T12:00:00+08:00', endAt: '2030-01-02T13:00:00+08:00' }, 200);
+  check('调整时段成功', adjB1.schedule.status === 'active');
+  const swOk = await J(`/api/rehearsals/${rhB}/switch-version`, director, { versionId: pv2 }, 200);
+  check('冲突解除后换版成功', swOk.rehearsal.versionId === pv2);
+  check('换版后文本未变的确认保留（sc2）', !swOk.pending.some((p) => p.actorId === chenId && p.sceneId === sc2));
+  check('换版后新增台词的场次需确认（sc1）', swOk.pending.some((p) => p.actorId === chenId && p.sceneId === sc1));
+
+  // RH_D 固定 v2 -> v3：sc2 在 v3 无台词 -> 既有安排待调整，不计入冲突
+  const rhD = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '日程排练D' }, 201)).id;
+  await J(`/api/rehearsals/${rhD}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  const schD1 = (await J(`/api/rehearsals/${rhD}/schedules`, director, { sceneId: sc2, startAt: '2030-01-04T10:00:00+08:00', endAt: '2030-01-04T11:00:00+08:00' }, 201)).schedule;
+  const swD = await J(`/api/rehearsals/${rhD}/switch-version`, director, { versionId: pv3 }, 200);
+  check('换版后无台词的既有安排标为待调整', swD.needsAdjustmentSchedules.includes(schD1.id), JSON.stringify(swD.needsAdjustmentSchedules));
+  // 待调整不计入冲突：林晚在 schD1 同时段可另排
+  const schA6 = (await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-04T10:30:00+08:00', endAt: '2030-01-04T11:30:00+08:00' }, 201)).schedule;
+  check('待调整时段不计入冲突', !!schA6.id);
+  // 待调整 -> 调整回有台词场次但时间重叠 -> 409；调到空档 -> 恢复有效
+  await req('PATCH', `/api/rehearsals/${rhD}/schedules/${schD1.id}`, director, { sceneId: sc1, startAt: '2030-01-04T10:00:00+08:00', endAt: '2030-01-04T11:00:00+08:00' }, 409);
+  const adjD = await req('PATCH', `/api/rehearsals/${rhD}/schedules/${schD1.id}`, director, { sceneId: sc1, startAt: '2030-01-04T12:00:00+08:00', endAt: '2030-01-04T13:00:00+08:00' }, 200);
+  check('待调整经调整后恢复有效', adjD.schedule.status === 'active' && adjD.schedule.sceneId === sc1);
+
+  console.log('— 日程：取消与可见性 —');
+  await J(`/api/rehearsals/${rhD}/schedules/${schD1.id}/cancel`, director, {}, 200);
+  await J(`/api/rehearsals/${rhD}/schedules/${schD1.id}/cancel`, director, {}, 400);
+  check('取消幂等保护（重复取消 400）', true);
+  // RH_E：制造一个仍处于待调整的安排，验证导演可见、演员不可见
+  const rhE = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '日程排练E' }, 201)).id;
+  await J(`/api/rehearsals/${rhE}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  const schE1 = (await J(`/api/rehearsals/${rhE}/schedules`, director, { sceneId: sc2, startAt: '2030-01-05T10:00:00+08:00', endAt: '2030-01-05T11:00:00+08:00' }, 201)).schedule;
+  await J(`/api/rehearsals/${rhE}/switch-version`, director, { versionId: pv3 }, 200);
+  const dirViewE = await G(`/api/rehearsals/${rhE}/schedules`, director);
+  check('导演可见待调整安排', dirViewE.schedules.some((s) => s.id === schE1.id && s.status === 'needs_adjustment'));
+  const dirViewEf = await G(`/api/rehearsals/${rhE}/schedules?status=needs_adjustment`, director);
+  check('导演可按状态过滤日程', dirViewEf.schedules.length === 1 && dirViewEf.schedules[0].id === schE1.id);
+  const dirViewD = await G(`/api/rehearsals/${rhD}/schedules`, director);
+  check('导演可见已取消安排', dirViewD.schedules.some((s) => s.id === schD1.id && s.status === 'cancelled'));
+  // 演员只看自己当前参与的有效时段
+  const linViewA = await G(`/api/rehearsals/${rhA}/schedules`, lin);
+  check('演员可见自己参与的有效时段', linViewA.schedules.length > 0 && linViewA.schedules.every((s) => s.status === 'active'));
+  check('演员时段含本人角色', linViewA.schedules.every((s) => s.myRoles.some((r) => r.roleId === roleA)));
+  const linViewD = await G(`/api/rehearsals/${rhD}/schedules`, lin);
+  check('演员看不到已取消时段', linViewD.schedules.length === 0);
+  const linViewE = await G(`/api/rehearsals/${rhE}/schedules`, lin);
+  check('演员看不到待调整时段', linViewE.schedules.length === 0);
+  await G(`/api/rehearsals/${rhC}/schedules`, lin, 403);
+  await J(`/api/rehearsals/${rhA}/schedules/${schA1.id}/cancel`, lin, {}, 403);
+  await req('PATCH', `/api/rehearsals/${rhA}/schedules/${schA1.id}`, lin, { startAt: '2030-01-01T09:00:00+08:00' }, 403);
+  check('未派角演员查看 403；演员不能调整/取消日程', true);
 
   console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);

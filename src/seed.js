@@ -62,6 +62,11 @@ function seed() {
       .run(play, v1, '首演排练（固定 v1）', director).lastInsertRowid;
     db.prepare('INSERT INTO rehearsal_cast (rehearsal_id, role_id, actor_id) VALUES (?, ?, ?)').run(rehearsal, rLin, lin);
     db.prepare('INSERT INTO rehearsal_cast (rehearsal_id, role_id, actor_id) VALUES (?, ?, ?)').run(rehearsal, rChen, chen);
+
+    // 示例日程：场次 I 的对词时段（带时区提交，服务端归一化为 UTC 存储）
+    db.prepare(
+      'INSERT INTO rehearsal_schedules (rehearsal_id, scene_id, start_at, end_at, created_by) VALUES (?, ?, ?, ?, ?)'
+    ).run(rehearsal, s1, '2026-10-10T06:00:00.000Z', '2026-10-10T07:30:00.000Z', director);
   });
 
   return true;

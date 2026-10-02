@@ -3,6 +3,7 @@ const { db, transaction, roleSceneHash } = require('./db');
 const { badRequest, notFound, forbidden, wrap } = require('./errors');
 const { authRequired, publicUser } = require('./auth');
 const { getPlayOrThrow, getVersionOfPlayOrThrow, formatVersion } = require('./plays');
+const { assertRehearsalSchedulesAfterCastChange, applySchedulesAfterVersionSwitch } = require('./schedules');
 
 const router = express.Router();
 router.use(authRequired);
@@ -241,6 +242,7 @@ router.post(
     const target = getVersionOfPlayOrThrow(targetVersionId, r.play_id);
     if (targetVersionId === r.version_id) throw badRequest('排练当前已固定在该版本');
 
+    let needsAdjustmentSchedules = [];
     transaction(() => {
       const old = r.version_id;
       // 仅保留“角色×场次”文本指纹在新旧版本间一致的确认；
@@ -273,12 +275,17 @@ router.post(
       db.prepare(
         'INSERT INTO rehearsal_version_log (rehearsal_id, from_version_id, to_version_id, actor_id) VALUES (?, ?, ?, ?)'
       ).run(r.id, old, targetVersionId, req.user.id);
+      // 日程：新版本中无台词场次的既有安排标为“待调整”（不计入冲突）；
+      // 其余有效时段按新版本重算参与者，与其他未取消时段重叠则抛 409，
+      // 整个事务回滚——版本与确认均不改变。
+      needsAdjustmentSchedules = applySchedulesAfterVersionSwitch(r.id, targetVersionId);
     });
 
     res.json({
       ok: true,
       rehearsal: serializeRehearsal(getRehearsalOrThrow(r.id)),
       pending: rehearsalPending(getRehearsalOrThrow(r.id), null),
+      needsAdjustmentSchedules,
     });
   })
 );
@@ -301,6 +308,7 @@ router.post(
       const existing = db
         .prepare('SELECT * FROM rehearsal_cast WHERE rehearsal_id = ? AND role_id = ?')
         .get(r.id, roleId);
+      let outcome;
       if (existing) {
         if (existing.actor_id === actorId) return { unchanged: true };
         // 改派：保留原演员的历史确认（待确认计算时不再计入），新演员需逐场重新确认
@@ -308,14 +316,19 @@ router.post(
           actorId,
           existing.id
         );
-        return { reassigned: true, fromActorId: existing.actor_id };
+        outcome = { reassigned: true, fromActorId: existing.actor_id };
+      } else {
+        db.prepare('INSERT INTO rehearsal_cast (rehearsal_id, role_id, actor_id) VALUES (?, ?, ?)').run(
+          r.id,
+          roleId,
+          actorId
+        );
+        outcome = { created: true };
       }
-      db.prepare('INSERT INTO rehearsal_cast (rehearsal_id, role_id, actor_id) VALUES (?, ?, ?)').run(
-        r.id,
-        roleId,
-        actorId
-      );
-      return { created: true };
+      // 派角/改派后：该排练有效时段的参与演员若与其他未取消时段重叠，
+      // 抛 409 整次回滚（派角不生效），响应携带冲突演员与时段。
+      assertRehearsalSchedulesAfterCastChange(r.id);
+      return outcome;
     });
     res.status(result.created ? 201 : 200).json({ ok: true, ...result });
   })

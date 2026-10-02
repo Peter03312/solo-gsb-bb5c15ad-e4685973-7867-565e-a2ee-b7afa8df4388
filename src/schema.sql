@@ -188,6 +188,25 @@ CREATE TABLE IF NOT EXISTS rehearsal_version_log (
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 排练日程：导演为某场次安排的带时区起止时段（可同场次多段）
+--   * status: active=有效；needs_adjustment=换版后该场次在新版本中已无台词，待调整；cancelled=已取消
+--   * 起止时间以 ISO 8601 提交（必须带时区），服务端归一化为 UTC 存储
+--   * 重叠判定为半开区间 [start, end)：端点相接不算重叠
+--   * 参与者 = 排练当前固定版本中本场有台词且已派角的演员（动态计算，不落库）
+CREATE TABLE IF NOT EXISTS rehearsal_schedules (
+  id            INTEGER PRIMARY KEY,
+  rehearsal_id  INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
+  scene_id      INTEGER NOT NULL REFERENCES scenes(id),
+  start_at      TEXT NOT NULL,
+  end_at        TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'active'
+                  CHECK (status IN ('active', 'needs_adjustment', 'cancelled')),
+  created_by    INTEGER REFERENCES users(id),
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  cancelled_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_schedules_rehearsal ON rehearsal_schedules(rehearsal_id);
+
 -- 演员按“所派角色 × 场次”确认；content_hash 对应确认时排练固定版本的台词文本。
 -- 唯一键含 actor_id：角色改派后保留原演员的历史确认（不计入），新演员需重新确认。
 CREATE TABLE IF NOT EXISTS confirmations (
