@@ -15,4 +15,4 @@ for i in $(seq 1 30); do
   sleep 0.3
 done
 
-BASE="http://127.0.0.1:$PORT" node scripts/e2e.cjs
+DATA_DIR="$DATA_DIR" BASE="http://127.0.0.1:$PORT" node scripts/e2e.cjs

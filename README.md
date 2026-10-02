@@ -32,6 +32,20 @@
 5. 导演页面和总览页显示每个排练的**待确认演员/角色/场次及原因**，以及最近的发布冲突详情。
 6. 演员的剧本、版本、排练稿接口均只返回其所派角色的台词；越权访问、无效版本/场次会得到明确的 `403/400/404`。
 
+### 日程安排（带时区时段）
+
+1. 导演可为已有排练的**某场次**安排**多个**带时区的起止时段（ISO 8601，必须显式带 `Z` 或 `±HH:MM`）；
+   场次须属于该剧且在排练**当前固定版本中有台词**，**结束必须晚于开始**。
+2. **参与者**动态取“该排练当前固定版本中本场有台词且已派角的演员”；
+   有台词但**未派角的角色列为待补派**（`uncastRoles`），不阻止安排。
+3. **冲突规则**：保存/调整时段、派角/改派、换版时，若参与演员与其他**未取消**时段重叠，
+   **整次操作拒绝**并返回 `409 SCHEDULE_CONFLICT`（`details.conflicts` 含冲突演员与时段）；
+   **端点相接不算重叠**（如 10:00–11:00 与 11:00–12:00 可共存）；冲突按演员跨排练检测。
+4. **换版后无台词**的既有安排自动标为**待调整**（`needsAdjustment`），**不计入冲突**；
+   失败的换版不改变版本与任何确认；成功换版仍遵循上面的确认规则。
+5. 导演可**取消**安排（可再次安排同时段），并在日程列表/排练详情中查看**待补派、待调整、已取消**汇总；
+   **演员只看自己当前参与的有效时段**（`GET /api/rehearsals/:id/schedules` 或跨排练的 `GET /api/my/schedules`）。
+
 ## 一键启动（Docker，推荐）
 
 前置：已安装 Docker 与 Docker Compose v2。
@@ -99,16 +113,19 @@ PORT=8080 docker compose up --build -d
 | 演员 | `chen` | `actor123` | 陈默，饰演船员 |
 | 演员 | `zhou` | `actor123` | 周海，初始未派角 |
 
-演示数据包含剧本《夜航灯塔》（2 个场次、2 个角色、7 句台词，已发布 v1）和一个固定 v1 的排练。
+演示数据包含剧本《夜航灯塔》（2 个场次、2 个角色、7 句台词，已发布 v1）、一个固定 v1 的排练，
+以及该排练场次 I 的一次演示日程（2026-11-15 19:00–21:00 +08:00）。
 
 ## 页面与操作路径
 
 - **导演 → 剧本与版本**：建剧本、加场次/角色、录入草稿台词、发布首版、查看各版本快照。
 - **导演 → 修订发布**：选基准版本建修订、逐条添加改/增/删（界面可一键填入所选台词原文）、
   勾选多个修订发布；冲突时页面展示每处冲突的“修订声称原文 vs 现行文本”，并可在发布记录中回看。
-- **导演 → 排练与确认**：创建固定版本的排练、显式换版、派角/改派，查看待确认清单与冲突。
+- **导演 → 排练与确认**：创建固定版本的排练、显式换版、派角/改派，查看待确认清单与冲突；
+  在排练详情中安排/调整/取消带时区时段，查看待补派、待调整与已取消安排。
 - **导演 → 总览**：所有排练的待确认汇总与最近冲突详情。
-- **演员**：进入排练后仅显示本人角色台词，按场次点“确认本场台词”；换版或改派后相应场次会回到待确认。
+- **演员**：进入排练后仅显示本人角色台词，按场次点“确认本场台词”；换版或改派后相应场次会回到待确认；
+  首页列出本人当前参与的有效排练时段。
 
 ## HTTP API 摘要（均返回 JSON，会话用 Cookie 或 `Authorization: Bearer <token>`）
 
@@ -127,21 +144,59 @@ PORT=8080 docker compose up --build -d
 | POST | `/api/plays/:id/publish` | 发布（冲突返回 409 且不生效） |
 | GET | `/api/plays/:id/publish-attempts` | 发布记录与冲突详情 |
 | POST/GET | `/api/plays/:id/rehearsals` · `/api/rehearsals` | 建排练 / 列表 |
-| GET | `/api/rehearsals/:id` | 派角、待确认、换版历史、最近冲突 |
-| POST | `/api/rehearsals/:id/switch-version` | 显式换版 |
-| POST/DELETE | `/api/rehearsals/:id/cast[/:roleId]` | 派角/改派/取消 |
+| GET | `/api/rehearsals/:id` | 派角、待确认、换版历史、日程、最近冲突 |
+| POST | `/api/rehearsals/:id/switch-version` | 显式换版（日程冲突时 409 且不生效） |
+| POST/DELETE | `/api/rehearsals/:id/cast[/:roleId]` | 派角/改派/取消（派角冲突时 409 且不生效） |
 | GET | `/api/rehearsals/:id/script` | 演员排练稿（仅本人角色） |
 | POST | `/api/rehearsals/:id/confirm` | 演员逐场确认 |
+| POST/GET | `/api/rehearsals/:id/schedules` | 安排带时区时段（导演）/ 日程列表（导演看全部，演员只看自己参与的有效时段） |
+| PATCH | `/api/rehearsals/:id/schedules/:sid` | 调整时段（冲突则 409 不生效） |
+| POST | `/api/rehearsals/:id/schedules/:sid/cancel` | 取消安排 |
+| GET | `/api/my/schedules` | 演员跨排练的有效时段 |
 | GET | `/api/dashboard` | 导演总览 |
 
 错误统一形如 `{ "error": "CODE", "message": "...", "details": ... }`，
 典型状态码：`400`（无效版本/场次/参数）、`401`（未登录）、`403`（越权）、`404`（不存在）、
-`409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`）。
+`409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`）。
+
+## 日程接口调用示例（curl）
+
+```bash
+# 登录拿 token（导演）
+TOKEN=$(curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}' | jq -r .token)
+
+# 为排练 1 的场次 1 安排一个带时区的时段（必须显式带时区，结束须晚于开始）
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"sceneId":1,"startAt":"2026-11-20T19:00:00+08:00","endAt":"2026-11-20T21:30:00+08:00","note":"联排"}'
+# -> 201：返回 participants（已派角演员）与 uncastRoles（待补派角色，不阻止安排）
+
+# 同一演员若与其他未取消时段重叠 -> 409，details.conflicts 给出冲突演员与时段
+# {"error":"SCHEDULE_CONFLICT","message":"参与演员与其他未取消时段重叠，本次操作未生效",
+#  "details":{"conflicts":[{"actorId":2,"actorName":"林晚","slots":[{...},{...}]}]}}
+
+# 导演查看日程（含待补派/待调整/已取消汇总）
+curl -s http://localhost:3000/api/rehearsals/1/schedules -H "Authorization: Bearer $TOKEN"
+
+# 调整时段（只调开始时间亦可）；取消安排
+curl -s -X PATCH http://localhost:3000/api/rehearsals/1/schedules/1 \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"startAt":"2026-11-20T19:30:00+08:00","endAt":"2026-11-20T21:30:00+08:00"}'
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/cancel \
+  -H "Authorization: Bearer $TOKEN"
+
+# 演员查看自己当前参与的有效时段（先以演员登录）
+curl -s http://localhost:3000/api/my/schedules -H "Authorization: Bearer $ACTOR_TOKEN"
+```
 
 ## 测试
 
 端到端测试会用临时数据目录自动起停服务器，覆盖：认证与越权、修订原文校验、
-多种发布冲突与幂等合并、版本快照不可改写触发器、换版后按内容变化重确认、改派后原确认失效等：
+多种发布冲突与幂等合并、版本快照不可改写触发器、换版后按内容变化重确认、改派后原确认失效，
+以及日程安排（带时区校验、待补派、端点相接、保存/派角/换版冲突整次拒绝、
+失败换版不改版本与确认、待调整不计入冲突、取消与演员视角）：
 
 ```bash
 npm test
@@ -160,6 +215,7 @@ src/
   plays.js         剧本、场次、角色、台词、版本
   revisions.js     修订与发布（冲突检测核心）
   rehearsals.js    排练、派角、换版、逐场确认
+  schedules.js     排练日程：带时区时段、参与者/待补派计算、重叠冲突检测
   server.js        Express 入口
 public/            原生 JS 单页前端
 scripts/           安装兜底脚本与端到端测试

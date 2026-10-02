@@ -73,9 +73,15 @@ async function toggleRehearsalDetail(id) {
   if (box.dataset.open) { box.innerHTML = ''; box.dataset.open = ''; return; }
   box.dataset.open = '1';
   box.innerHTML = '<span class="muted">加载中…</span>';
+  await refreshRehearsalDetail(id);
+}
+
+async function refreshRehearsalDetail(id) {
+  const box = document.getElementById(`rehDetail-${id}`);
+  if (!box || !box.dataset.open) return;
   const data = await api('GET', `/api/rehearsals/${id}`);
   box.innerHTML = '';
-  box.appendChild(renderRehearsalDetail(data, () => toggleRehearsalDetail(id).then(() => {})));
+  box.appendChild(renderRehearsalDetail(data, () => refreshRehearsalDetail(id)));
 }
 
 function renderRehearsalDetail(data, reload) {
@@ -164,6 +170,9 @@ function renderRehearsalDetail(data, reload) {
     : '<span class="badge done">全部确认完毕</span>';
   wrap.appendChild(pendBox);
 
+  // 日程安排（导演）：创建带时区时段、查看待补派/待调整/已取消、调整或取消
+  wrap.appendChild(renderScheduleSection(data, reload));
+
   // 冲突详情
   if (lastPublishAttempt && lastPublishAttempt.hadConflict) {
     const cbox = el(`<div style="margin-top:8px"><h3>最近一次发布冲突（本次发布未生效）</h3></div>`);
@@ -184,6 +193,121 @@ function renderRehearsalDetail(data, reload) {
 async function loadActors() {
   // 导演可通过演员列表接口获取；若未暴露则从后端 dashboard 不可得，这里走专用端点
   return (await api('GET', '/api/actors')).actors;
+}
+
+/* ---------- 导演：日程安排 ---------- */
+function fmtRange(s) {
+  return `${s.startAt} → ${s.endAt}`;
+}
+
+function renderScheduleSection(data, reload) {
+  const { rehearsal, schedules = [], summary } = data;
+  const box = el(`
+    <div style="margin-top:8px">
+      <h3>日程安排（带时区时段）
+        ${summary ? `<span class="badge pending">待补派 ${summary.pendingCast}</span>
+        <span class="badge pending">待调整 ${summary.needsAdjustment}</span>
+        <span class="badge abandoned">已取消 ${summary.cancelled}</span>` : ''}
+      </h3>
+      <div class="schedRows"></div>
+      <form class="flex schedForm" style="margin-top:6px">
+        <select name="sceneId" class="sceneSel" style="max-width:180px" required></select>
+        <input name="startAt" type="datetime-local" style="max-width:210px" required />
+        <input name="endAt" type="datetime-local" style="max-width:210px" required />
+        <input name="note" placeholder="备注（可选）" style="max-width:140px" />
+        <button class="btn small primary" type="submit">安排时段</button>
+      </form>
+      <div class="muted">参与者 = 当前固定版本中本场有台词且已派角的演员；起止按本机时区提交为带时区时间。端点相接不算重叠。</div>
+    </div>`);
+
+  const sceneSel = box.querySelector('.sceneSel');
+  api('GET', `/api/plays/${rehearsal.playId}`).then((detail) => {
+    sceneSel.innerHTML = detail.scenes
+      .map((s) => `<option value="${s.id}">${esc(s.code)} ${esc(s.title)}</option>`)
+      .join('');
+  });
+
+  box.querySelector('.schedForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('POST', `/api/rehearsals/${rehearsal.id}/schedules`, {
+        sceneId: Number(fd.get('sceneId')),
+        startAt: new Date(fd.get('startAt')).toISOString(),
+        endAt: new Date(fd.get('endAt')).toISOString(),
+        note: fd.get('note'),
+      });
+      toast('时段已安排');
+      reload();
+    } catch (err) {
+      toast(scheduleErrText(err), true);
+    }
+  });
+
+  const rows = box.querySelector('.schedRows');
+  if (!schedules.length) {
+    rows.innerHTML = '<span class="muted">暂无日程安排</span>';
+    return box;
+  }
+  for (const s of schedules) {
+    const cancelled = s.status === 'cancelled';
+    const badges = [
+      cancelled ? '<span class="badge abandoned">已取消</span>' : '',
+      s.needsAdjustment ? '<span class="badge pending">待调整：换版后本场次无台词</span>' : '',
+      !cancelled && s.uncastRoles.length
+        ? `<span class="badge pending">待补派：${esc(s.uncastRoles.map((r) => r.roleName).join('、'))}</span>`
+        : '',
+    ].join('');
+    const participants = !cancelled && s.participants.length
+      ? `参与者：${esc([...new Set(s.participants.map((p) => p.actorName))].join('、'))}`
+      : (!cancelled ? '暂无参与者' : '');
+    const row = el(`
+      <div class="line-row">
+        <div class="flex">
+          <div class="grow">
+            <strong>${esc(s.sceneCode)} ${esc(s.sceneTitle)}</strong>
+            <span class="muted">${esc(fmtRange(s))}</span>
+            ${s.note ? `<span class="muted">· ${esc(s.note)}</span>` : ''}
+            ${badges}
+            <div class="muted">${participants}</div>
+          </div>
+          ${cancelled ? '' : '<button class="btn small adjustBtn">调整时段</button><button class="btn small danger cancelBtn">取消</button>'}
+        </div>
+      </div>`);
+    if (!cancelled) {
+      row.querySelector('.adjustBtn').addEventListener('click', async () => {
+        const startAt = prompt('新的开始时间（ISO 8601，带时区）', s.startAt);
+        if (startAt == null) return;
+        const endAt = prompt('新的结束时间（ISO 8601，带时区）', s.endAt);
+        if (endAt == null) return;
+        try {
+          await api('PATCH', `/api/rehearsals/${rehearsal.id}/schedules/${s.id}`, { startAt, endAt });
+          toast('时段已调整');
+          reload();
+        } catch (err) {
+          toast(scheduleErrText(err), true);
+        }
+      });
+      row.querySelector('.cancelBtn').addEventListener('click', async () => {
+        try {
+          await api('POST', `/api/rehearsals/${rehearsal.id}/schedules/${s.id}/cancel`);
+          toast('已取消该时段');
+          reload();
+        } catch (err) { toast(err.message, true); }
+      });
+    }
+    rows.appendChild(row);
+  }
+  return box;
+}
+
+function scheduleErrText(err) {
+  const conflicts = err.data?.details?.conflicts;
+  if (!conflicts) return err.message;
+  const who = conflicts
+    .map((c) => `${c.actorName}（${c.slots.map((s) => `${s.sceneTitle} ${s.startAt}`).join(' / ')}）`)
+    .join('；');
+  return `${err.message}：${who}`;
 }
 
 async function loadDashboard() {
@@ -230,7 +354,10 @@ async function loadDashboard() {
 async function loadActorHome() {
   const panel = document.getElementById('actorView');
   panel.innerHTML = '<p class="muted">加载中…</p>';
-  const { rehearsals } = await api('GET', '/api/rehearsals');
+  const [{ rehearsals }, mySched] = await Promise.all([
+    api('GET', '/api/rehearsals'),
+    api('GET', '/api/my/schedules'),
+  ]);
   panel.innerHTML = '';
   const card = el('<div class="card"><h2>我的排练</h2></div>');
   for (const r of rehearsals) {
@@ -245,6 +372,21 @@ async function loadActorHome() {
   }
   if (!rehearsals.length) card.innerHTML += '<p class="muted">你暂时没有被分配到任何排练。</p>';
   panel.appendChild(card);
+
+  // 我的排练时段：仅自己当前参与的有效时段
+  const schedCard = el(`<div class="card"><h2>我的排练时段（${mySched.schedules.length}）</h2></div>`);
+  if (!mySched.schedules.length) {
+    schedCard.innerHTML += '<p class="muted">暂无安排给你的有效时段。</p>';
+  }
+  for (const s of mySched.schedules) {
+    schedCard.appendChild(el(`
+      <div class="line-row">
+        <strong>${esc(s.rehearsalName)}</strong>
+        <span class="badge v">${esc(s.sceneCode)} ${esc(s.sceneTitle)}</span>
+        <div class="muted">${esc(fmtRange(s))}${s.note ? ` · ${esc(s.note)}` : ''} · 角色：${esc(s.myRoles.map((r) => r.roleName).join('、'))}</div>
+      </div>`));
+  }
+  panel.appendChild(schedCard);
 }
 
 async function loadActorScript(rehearsalId) {

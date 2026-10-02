@@ -62,6 +62,14 @@ function seed() {
       .run(play, v1, '首演排练（固定 v1）', director).lastInsertRowid;
     db.prepare('INSERT INTO rehearsal_cast (rehearsal_id, role_id, actor_id) VALUES (?, ?, ?)').run(rehearsal, rLin, lin);
     db.prepare('INSERT INTO rehearsal_cast (rehearsal_id, role_id, actor_id) VALUES (?, ?, ?)').run(rehearsal, rChen, chen);
+
+    // 演示日程：场次 I 的一次带时区安排（参与者 = 当前版本本场有台词且已派角的林晚、陈默）
+    const startAt = '2026-11-15T19:00:00+08:00';
+    const endAt = '2026-11-15T21:00:00+08:00';
+    db.prepare(
+      `INSERT INTO rehearsal_schedules (rehearsal_id, scene_id, start_at, end_at, start_ts, end_ts, note, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(rehearsal, s1, startAt, endAt, Date.parse(startAt), Date.parse(endAt), '首演联排', director);
   });
 
   return true;
